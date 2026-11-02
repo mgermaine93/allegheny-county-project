@@ -10,7 +10,7 @@ The answer is the table `analytics.muni_price_growth`.
 
 ## Quick start
 
-Requires Python 3.9+ (developed on 3.12). No cloud accounts or API keys.
+Requires Python 3.11+ (developed on 3.12). No cloud accounts or API keys necessary.
 
 ```bash
 python -m venv .venv
@@ -64,7 +64,7 @@ CKAN resource_show ──► data/raw/sales_<last_modified>.csv   (byte-for-byte
 | File                                      | Purpose                                                                                                                                              |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main2.py`                                | The whole pipeline, in run order: config → extract (download) → load (raw + sale codes) → transform (clean + analytics) → checks → `run_pipeline()`. |
-| `5_sales-validation-codes-dictionary.csv` | The county's sale validation code dictionary (from the WPRDC dataset page).                                                                          |
+| `5_sales-validation-codes-dictionary.csv` | The county's sale validation code dictionary, obtained from the dataset's Data Steward (see below).                                                  |
 
 ## The output table
 
@@ -88,6 +88,8 @@ Rules:
 All thresholds live in `PipelineConfig` in `main2.py`.
 
 ### Results (snapshot of 2026-10-26)
+
+Later snapshots shift a few positions slightly. On the 2026-11-02 snapshot the top 5 and the county-wide figures are unchanged, and 24th Ward and Clairton swap places at 6 and 7.
 
 County-wide, the median valid sale price rose from **$140,000** in 2012–13 to **$220,000** in 2021–22 (+57%).
 
@@ -116,7 +118,7 @@ Any failed check raises `DataQualityError`. The transaction rolls back, so the p
 
 | Check                                                                                           | Why                                                                                                                                                                                              |
 | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Parsed row count equals the file's line count, and column names have no stray whitespace        | Guards the relaxed CSV parsing (see [Surprises](#what-surprised-me-in-the-data))                                                                                                                 |
+| Parsed row count equals the file's line count, and column names have no stray whitespace        | Guards the relaxed CSV parsing (see [Surprises](#surprises))                                                                                                                                     |
 | Raw and clean row counts match                                                                  | Nothing gained or lost in the transform                                                                                                                                                          |
 | `(parcel_id, sale_date, deed_book, deed_page)` is unique                                        | This is the real key. The source `_id` is reassigned on every refresh.                                                                                                                           |
 | Parcel IDs are 16 characters                                                                    | Documented format                                                                                                                                                                                |
@@ -173,12 +175,16 @@ I also chose to download the full CSV dump rather than page through `datastore_s
 - _All transfers with a price filter (e.g. > $10,000)._ Many non-market transfers have realistic prices: sheriff sales, multi-parcel deeds, corporate transfers, estate sales. The county has already reviewed every sale, and ignoring that work would be a mistake.
 - _Means._ A few outliers dominate; the maximum price is $148.8M.
 - _Single-year comparisons._ Too noisy for small municipalities.
-- _Ending in 2024 or 2025._ Sales after 2022 are badly incomplete (see below).
+- _Ending in 2024 or 2025._ When I built the analysis, sales after 2022 were badly incomplete (see below).
 
-## What surprised me in the data
+## Surprises
 
-- **Sales almost disappear after 2022.** Every year from 2012 to 2022 has 33,000–40,000 sales. Then 2023 has 4,653, 2024 has 4,740, 2025 has 509 and 2026 has 3. The dataset says it's updated monthly, and record dates run into October 2026, but recent sales are mostly missing. This could be a recording lag or an upstream problem, and it's why the analysis stops at 2022.
+Figures below are from the 2026-10-26 snapshot (397,885 rows), unless noted.
+
+- **Sales almost disappear after 2022.** Every year from 2012 to 2022 has 33,000–40,000 sales. Then 2023 has 4,653, 2024 has 4,740, 2025 has 509 and 2026 has 3. The dataset says it's updated monthly, and record dates run into October 2026, but recent sales are mostly missing. This could be a recording lag or an upstream problem, and it's why I chose to leave everything after 2022 out of the analysis.
+- **...and then they came back.** The 2026-11-02 refresh added about 109,000 rows (507,028 in total), backfilling 2023–2026 to roughly 31,000 sales a year. The pipeline handled this as designed: it loaded the refresh as a new snapshot, rebuilt the clean and output tables, and passed every check, all with no code changes. The source `_id`s were reassigned again (now 19,391,857–19,899,013), which confirms they can't be used as a key.
 - **Only about 17% of transfers are market sales.** "Love and affection" (family) transfers alone number 79,118. Only 67,430 sales are code `0` (valid), and 92,042 transfers have a price of $1 or less.
+- **The key to reading the data wasn't published with it.** The API documentation refers to a "Sales Validation Codes Dictionary" several times, but I couldn't find it on the dataset page. Without it, there's no reliable way to tell an arm's-length sale from a family transfer or sheriff sale, which the whole analysis depends on. As a result, I contacted Mary Beth Snyder (the dataset's listed Data Steward) and she sent me the file. Since it isn't available through the API, it's committed to the repo as reference data, the one input the pipeline doesn't download.
 - **The dictionary doesn't match the data.**
   - `PV` (32 rows) isn't in the dictionary.
   - About 7,000 rows still use codes the dictionary calls discontinued (`Z`, `28`, `ND`, `5`, `X`, …).
@@ -209,23 +215,20 @@ With daily refreshes:
 
 ## What I didn't do, and why
 
+- **No update to the end window after the backfill.** Now that 2023–2025 are filled in, comparing 2012–13 against 2024–25 would be the natural next step (it's a one-line change to `end_years` in `PipelineConfig`). The 2026-11-02 refresh arrived on the submission deadline, which didn't leave time to re-check the results and write-up against a new window.
 - **No repeat-sales or quality-adjusted price index.** Median price measures _which_ properties sold as well as how prices moved. If a ward's sales shift toward new construction or renovations, its median rises even if existing homes didn't gain value. A repeat-sales index (comparing the same parcel's sales over time) would answer the question more accurately, but it's a significant modeling project.
 - **No property-type filter.** The sales dataset doesn't include property class (residential, commercial, etc.). Getting it means joining the separate property assessments dataset. The valid-sale filter removes most non-residential noise, but not all.
 - **No inflation adjustment.** Prices are nominal dollars. Cumulative CPI inflation from 2012–13 to 2021–22 was roughly 20–25%, which would shrink every growth figure but barely change the ranking.
 - **No quarantine table.** Rows with suspect record dates are flagged (`record_date_suspect`) rather than moved aside. Record date isn't used in the analysis, so dropping them would only lose valid sale prices.
 - **No geography or maps.** Municipality names are enough to answer the question; mapping would need boundary shapefiles.
 - **No scheduling, CI, or snapshot cleanup.** These are out of scope for a local, run-on-demand exercise. Raw snapshots will accumulate (~86 MB each) until a cleanup policy is added.
-<!-- TODO: if you add pytest tests, remove this bullet -->
-- **No automated tests.** The checks run on every load, but I haven't written unit tests that feed in deliberately bad data to prove each check fires.
 
 ## AI disclosure
-
-<!-- TODO: confirm this matches what you actually did, and add anything else you used AI for (e.g. the extract step). -->
 
 I used **Claude Code (Claude Opus 5.5)** as a coding assistant. Specifically:
 
 - **Data profiling:** It ran exploratory queries against the API and the raw file. That surfaced the post-2022 coverage gap, the unstable `_id`, the undocumented `PV` code and the dirty dates.
-- **Code:** It wrote the first draft of `main2.py` (raw loading, sale code parsing, clean and analytics SQL, quality checks) on top of my extract code. It also diagnosed the mixed-line-ending CSV problem.
-- **This README:** It wrote the first draft, which I then edited.
+- **Code:** It wrote most of the first draft of `main2.py` (raw loading, sale code parsing, clean and analytics SQL, quality checks) on top of my extract code. It also diagnosed the mixed-line-ending CSV problem, and added function docstrings which I reviewed.
+- **This README:** It wrote the first draft, which I then edited. It also did a final review: it re-ran the pipeline from a fresh clone and checked the README's claims against the data.
 
-I chose the dataset and the question, and I reviewed and approved the design decisions before any code was written.
+I chose the dataset and the question; I reviewed and approved the design decisions before any code was written; I refined the code and pipeline once it was written; and I discovered the need for the "Sales Validation Codes" dictionary.

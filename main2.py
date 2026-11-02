@@ -66,7 +66,7 @@ class PipelineConfig:
     )
     # the question: where did arm's-length prices grow fastest between these two windows?
     # windows are pooled across two years to smooth out thin municipalities.
-    # 2022 is the last year with complete coverage; 2023+ has ~1/8th the usual volume.
+    # chosen when the 2026-10-26 snapshot had only ~1/8th the usual volume for 2023+ (backfilled on 2026-11-02).
     base_years: tuple = (2012, 2013)
     end_years: tuple = (2021, 2022)
     min_sales_per_window: int = 30 # municipalities with fewer valid sales in either window are left out
@@ -99,7 +99,17 @@ class DataQualityError(Exception):
 
 def make_session(config: APIConfig) -> requests.Session:
     """
-    Returns a session that retries on the 502/503/504 errors the WPRDC server returns intermittently.
+    Builds an HTTP session that automatically retries failed requests.
+
+    The WPRDC server intermittently returns 502/503/504 errors (and 429 when rate limiting), so every
+    GET made through this session is retried up to config.max_retries times with exponential backoff
+    (2s, 4s, 8s, ...) before giving up. Only GETs are retried, since the pipeline never sends anything else.
+
+    Args:
+        config: API settings; only max_retries is used here.
+
+    Returns:
+        A requests.Session with the retry policy mounted on all https:// URLs.
     """
     retry = Retry(
         total=config.max_retries,
@@ -114,8 +124,29 @@ def make_session(config: APIConfig) -> requests.Session:
 
 def extract_raw(config: APIConfig, raw_dir: Path) -> Path:
     """
-    Looks up the resource through the CKAN API and saves its CSV dump byte-for-byte.
-        Files are named by the source's last_modified date, so re-running against the same version is a no-op.
+    Extract step: downloads the current version of the sales data and saves it unchanged.
+
+    1. Calls the CKAN resource_show endpoint to get the resource's metadata, including its download
+       URL and last_modified timestamp.
+    2. Names the target file after that date (sales_YYYY-MM-DD.csv). If the file already exists, this
+       version has been downloaded before, so it returns immediately without downloading again.
+    3. Otherwise streams the CSV dump to a .part file in 1 MB chunks (so the ~86 MB file never sits in
+       memory), and renames it only once the download is complete. An interrupted download therefore
+       never leaves a partial file under the real name.
+    4. Saves the resource metadata next to it as sales_YYYY-MM-DD.meta.json, for traceability.
+
+    The file is written byte-for-byte as served: no parsing or cleaning happens here.
+
+    Args:
+        config: API settings (base URL, resource ID, timeout, retries).
+        raw_dir: Directory the raw files are saved in; created if it doesn't exist.
+
+    Returns:
+        Path to the raw CSV for the current version of the dataset.
+
+    Raises:
+        requests.HTTPError: if the metadata lookup or download still fails after retries.
+        RuntimeError: if the CKAN API responds but reports success = false.
     """
     session = make_session(config)
     response = session.get(f"{config.base_url}/resource_show", params={"id": config.resource_id}, timeout=config.timeout_seconds)
@@ -148,8 +179,33 @@ def extract_raw(config: APIConfig, raw_dir: Path) -> Path:
 
 def load_raw_snapshot(con: duckdb.DuckDBPyConnection, raw_path: Path) -> str:
     """
-    Appends the raw CSV to raw.sales exactly as published (every column as text), tagged with its snapshot date.
-    A snapshot that's already loaded is skipped, so re-running never duplicates rows.
+    Load step: appends one raw CSV to the raw.sales table, exactly as published.
+
+    Every column is loaded as text (all_varchar), so values like ZIP codes, deed pages, and malformed
+    dates are stored exactly as they appear in the file. Type conversion happens later in
+    build_clean_sales. Each row is tagged with the snapshot date taken from the file name, plus a
+    loaded_at timestamp. raw.sales keeps every snapshot ever loaded and is never modified.
+
+    The steps:
+    1. Creates the raw schema and an empty raw.sales table (matching the CSV's columns) if they don't exist.
+    2. If rows for this snapshot date are already in raw.sales, skips the load. This is what keeps
+       re-runs from duplicating data.
+    3. Before inserting, confirms the parse is trustworthy. The CKAN dump has mixed line endings, so
+       DuckDB's strict CSV mode has to be off. To make up for it, the number of parsed rows must equal
+       the number of lines in the file minus the header, and no column name can have stray whitespace
+       (e.g. a leftover \\r).
+    4. Inserts the rows. The insert is a single statement, so a snapshot is either fully loaded or not at all.
+
+    Args:
+        con: Open DuckDB connection.
+        raw_path: Path to a raw CSV saved by extract_raw (named sales_YYYY-MM-DD.csv).
+
+    Returns:
+        The snapshot date string (YYYY-MM-DD) identifying these rows in raw.sales.
+
+    Raises:
+        DataQualityError: if the parsed row count doesn't match the file's line count, or column names
+            have stray whitespace. Nothing is inserted in either case.
     """
     snapshot_date = raw_path.stem.removeprefix("sales_") # files are named sales_<last_modified date>.csv
     # the CKAN dump ends the header line with \r\n but every data row with \n, which DuckDB's strict mode rejects.
@@ -188,9 +244,29 @@ def load_raw_snapshot(con: duckdb.DuckDBPyConnection, raw_path: Path) -> str:
 
 def read_sale_codes(config: PipelineConfig) -> pd.DataFrame:
     """
-    Parses the sale validation codes dictionary into one row per code.
-    The file has a prose preamble, is Windows-1252 encoded, and lumps discontinued codes into a single
-    "all other codes" row, so those get split out into their own rows here.
+    Parses the county's sale validation codes dictionary into a lookup table with one row per code.
+
+    The dictionary says whether each sale code means a valid (arm's-length) sale, an invalid one, or
+    one that hasn't been reviewed yet. The analysis depends on it to separate market sales from family
+    transfers, sheriff sales, and so on. The file needs some handling:
+    - It's Windows-1252 encoded, not UTF-8.
+    - It starts with paragraphs of explanation, so the header row ("Validity Group,Code,...") is found
+      by searching for it rather than assuming a line number.
+    - Discontinued codes are lumped into one "all other codes" row whose description ends with a list
+      like "(UX, VB, VH, ...)". That list is extracted and each code becomes its own "Invalid Sale" row,
+      as the dictionary instructs.
+    - Codes from config.reviewed_extra_codes (seen in the data but missing from the dictionary, e.g. PV)
+      are added as well.
+
+    Args:
+        config: Pipeline settings; uses codes_path and reviewed_extra_codes.
+
+    Returns:
+        DataFrame with columns validity_group, sale_code, and code_desc, one row per code.
+
+    Raises:
+        DataQualityError: if the "all other codes" row can't be found, or any code appears more than
+            once (e.g. a reviewed code that the dictionary has since added).
     """
     lines = config.codes_path.read_text(encoding="cp1252").splitlines()
     header_row = next(i for i, line in enumerate(lines) if line.startswith("Validity Group,"))
@@ -222,8 +298,30 @@ def read_sale_codes(config: PipelineConfig) -> pd.DataFrame:
 
 def build_clean_sales(con: duckdb.DuckDBPyConnection, snapshot_date: str, codes: pd.DataFrame) -> None:
     """
-    Rebuilds clean.sales from one raw snapshot: typed columns, trimmed text, and the validity group for each sale.
-    It's a full rebuild rather than an upsert because the county corrects and deletes past records between refreshes.
+    Transform step: rebuilds the clean layer from a single raw snapshot.
+
+    Creates two tables, replacing any previous versions:
+    - clean.sale_codes: the parsed codes dictionary from read_sale_codes.
+    - clean.sales: one row per sale in the snapshot, with:
+        - snake_case column names
+        - dates and prices converted to real types (TRY_CAST turns unparseable values into NULL, which
+          run_checks then catches, instead of failing here)
+        - surrounding whitespace trimmed and blank strings turned into NULL
+        - validity_group joined in from the codes dictionary (NULL if the code is unknown)
+        - record_date_suspect: true when the record date is blank, earlier than the sale date, or
+          before 2000
+
+    No rows are dropped or deduplicated, so clean.sales always has exactly as many rows as the
+    snapshot. run_checks verifies this.
+
+    It's a full rebuild rather than an incremental upsert because the county corrects and deletes past
+    records between refreshes, and the source _id changes every time. Rebuilding from the latest
+    snapshot picks up corrections and deletions automatically.
+
+    Args:
+        con: Open DuckDB connection, normally inside run_pipeline's transaction.
+        snapshot_date: Which snapshot in raw.sales to build from.
+        codes: Sale codes lookup from read_sale_codes.
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS clean")
     con.register("codes_df", codes)
@@ -261,9 +359,29 @@ def build_clean_sales(con: duckdb.DuckDBPyConnection, snapshot_date: str, codes:
 
 def build_price_growth(con: duckdb.DuckDBPyConnection, config: PipelineConfig) -> None:
     """
-    Builds the output table: median arm's-length sale price per municipality in the base and end windows,
-    and how much it grew. Only sales the county judged valid are used, since family transfers,
-    sheriff sales, multi-parcel deeds, etc. don't reflect market value.
+    Transform step: builds the output table analytics.muni_price_growth, which answers the question.
+
+    The question is which municipalities saw the fastest growth in median arm's-length sale price
+    between the base window (default 2012-13) and the end window (default 2021-22).
+
+    How it's calculated, one stage per part of the SQL:
+    1. valid_sales: keeps only sales the county coded "Valid Sale" and priced at or above
+       config.min_valid_price, and labels each one 'base' or 'end' by its sale year. Family transfers,
+       sheriff sales, multi-parcel deeds and the like are excluded because their prices don't reflect
+       market value.
+    2. by_window: per municipality, counts the sales and takes the median price in each window.
+       Medians are used instead of means because a few very large sales (up to ~$149M) would
+       dominate a mean.
+    3. Final select: keeps only municipalities with at least config.min_sales_per_window sales in
+       both windows (fewer gives an unreliable median), then computes the total % change, the
+       annualized growth rate between the window midpoints, and a rank (1 = fastest growth).
+
+    Columns: growth_rank, muni_code, muni_name, base_sales, end_sales, base_median_price,
+    end_median_price, pct_change, annual_growth_pct.
+
+    Args:
+        con: Open DuckDB connection with clean.sales already built.
+        config: Pipeline settings; uses base_years, end_years, min_valid_price, and min_sales_per_window.
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS analytics")
     con.execute(f"""
@@ -313,10 +431,42 @@ def build_price_growth(con: duckdb.DuckDBPyConnection, config: PipelineConfig) -
 
 def run_checks(con: duckdb.DuckDBPyConnection, snapshot_date: str, config: PipelineConfig) -> None:
     """
-    Data quality checks. Any failure raises DataQualityError, which rolls back the transaction
-    so the previously published tables stay in place.
+    Runs the data quality checks against the newly built clean and analytics tables.
+
+    Every check runs, and all failures are collected and reported together, so one run shows every
+    problem rather than only the first. Any failure raises DataQualityError, which makes run_pipeline
+    roll back its transaction. The previously published tables then stay in place.
+
+    Checks that fail the run:
+    - raw and clean row counts match, and the snapshot isn't empty
+    - (parcel_id, sale_date, deed_book, deed_page) is unique; this is the real key, since the source
+      _id is reassigned on every refresh
+    - every parcel ID is 16 characters
+    - every sale date parsed and isn't in the future
+    - no negative prices
+    - every sale code has a validity group (dataset-specific: the data uses codes the dictionary
+      doesn't list, such as PV)
+    - no more than config.max_suspect_record_date_pct percent of rows have a suspect record date
+      (dataset-specific: blank dates, dates before the sale, and a year-0212 typo)
+    - the snapshot is no more than config.max_row_drop_pct percent smaller than the previous one
+    - the output table isn't empty and has no impossible medians
+    - the end window has full sales coverage (at least 20,000 sales in its last year)
+
+    Warning only (prints but doesn't fail): recent years look incomplete. That doesn't affect the
+    chosen windows, so it shouldn't block publishing.
+
+    Args:
+        con: Open DuckDB connection with the clean and analytics tables built.
+        snapshot_date: The snapshot being published, used to compare against raw.sales and the previous snapshot.
+        config: Pipeline settings with the check thresholds.
+
+    Raises:
+        DataQualityError: listing every check that failed.
     """
     def scalar(sql: str, params: list = None):
+        """
+        Runs a query that returns a single value (e.g. a count) and returns that value.
+        """
         return con.execute(sql, params or []).fetchone()[0]
 
     failures = []
@@ -381,8 +531,8 @@ def run_checks(con: duckdb.DuckDBPyConnection, snapshot_date: str, config: Pipel
     if bad_medians:
         failures.append(f"{bad_medians:,} municipalities with an impossible median price")
 
-    # warning only: the dataset claims monthly updates, but sales after 2022 are sparse.
-    # this doesn't affect the 2012-2022 analysis, so it shouldn't block the run
+    # warning only: the 2026-10-26 snapshot was missing most sales after 2022 despite monthly updates.
+    # recent gaps don't affect the 2012-2022 analysis, so they shouldn't block the run
     latest_full_year = scalar("""
         SELECT max(yr) FROM (
             SELECT year(sale_date) AS yr FROM clean.sales GROUP BY 1 HAVING count(*) >= 20000
@@ -402,7 +552,26 @@ def run_checks(con: duckdb.DuckDBPyConnection, snapshot_date: str, config: Pipel
 
 def run_pipeline(config: PipelineConfig = PIPELINE_CONFIG) -> None:
     """
-    Extract -> land raw -> transform -> check -> publish. Safe to run any number of times.
+    Runs the whole pipeline end to end: extract -> land raw -> transform -> check -> publish.
+
+    1. extract_raw downloads the current version of the dataset, unless it's already on disk.
+    2. read_sale_codes parses the codes dictionary.
+    3. load_raw_snapshot appends the file to raw.sales, unless that snapshot is already loaded. This
+       is committed on its own, so a later failure never throws away a good download.
+    4. build_clean_sales, build_price_growth, and run_checks run inside one transaction. If every
+       check passes it commits, publishing the new tables. If anything fails it rolls back, so the
+       last good tables stay in place, and re-raises the error.
+    5. Prints the top 10 municipalities from the output table.
+
+    Safe to run any number of times: an unchanged source means no new download, no new raw rows, and
+    the same clean and output tables.
+
+    Args:
+        config: Pipeline settings; defaults to PIPELINE_CONFIG.
+
+    Raises:
+        DataQualityError: if a load-time or post-build quality check fails.
+        requests.HTTPError / RuntimeError: if the download fails (see extract_raw).
     """
     raw_path = extract_raw(API_CONFIG, RAW_DIR)
     codes = read_sale_codes(config)
